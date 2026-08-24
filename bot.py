@@ -140,14 +140,13 @@ class SpotLiveBot:
                     "adjustForTimeDifference": True,
                     "recvWindow": 10000,
                     "fetchCurrencies": False,
-                    "fetchMarkets": ["spot"],
+                    "fetchMarkets": {"types": ["spot"]},
                 },
             }
         )
         self.exchange.set_sandbox_mode(False)
         self.exchange.has["fetchCurrencies"] = False
-        self.exchange.options["fetchMarkets"] = ["spot"]
-        self.exchange.options["defaultFetchMarkets"] = ["spot"]
+        self.exchange.options["fetchMarkets"] = {"types": ["spot"]}
         self.exchange.options["defaultType"] = "spot"
         self.specs: dict[str, SymbolSpec] = {}
         self.state = BotState()
@@ -155,19 +154,41 @@ class SpotLiveBot:
 
     def connect(self) -> None:
         try:
-            self.exchange.load_markets()
+            self._load_spot_markets_public()
+            self._load_specs()
+            self.capital_usdt = self._resolve_capital()
+            self._restore_state()
+            self._recover_positions()
         except ccxt.AuthenticationError as exc:
             self._abort_if_auth_error(exc)
             raise
         except ccxt.BaseError as exc:
             self._abort_if_geo_blocked(exc)
             raise
-        self._load_specs()
-        self.capital_usdt = self._resolve_capital()
-        self._restore_state()
-        self._recover_positions()
         log("CONNECT", "Binance Spot LIVE API connected")
         log("CAPITAL", f"Allocated trading capital: {self.capital_usdt:.2f} USDT")
+
+    def _load_spot_markets_public(self) -> None:
+        """Load Spot markets from public exchangeInfo only. Never call signed margin/sapi."""
+        client = self.exchange
+        saved_key, saved_secret = client.apiKey, client.secret
+        client.apiKey = None
+        client.secret = None
+        try:
+            raw = client.public_get_exchange_info()
+            rows = [
+                row
+                for row in (raw.get("symbols") or [])
+                if row.get("status") == "TRADING"
+                and row.get("quoteAsset") == QUOTE_ASSET
+                and row.get("isSpotTradingAllowed", True)
+            ]
+            markets = client.parse_markets(rows)
+            client.set_markets(markets)
+            log("CONNECT", f"Loaded {len(client.markets)} public Spot {QUOTE_ASSET} markets")
+        finally:
+            client.apiKey = saved_key
+            client.secret = saved_secret
 
     @staticmethod
     def _abort_if_geo_blocked(exc: BaseException) -> None:
