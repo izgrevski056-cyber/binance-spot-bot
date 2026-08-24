@@ -150,13 +150,35 @@ class SpotLiveBot:
         self.capital_usdt = Decimal("250")
 
     def connect(self) -> None:
-        self.exchange.load_markets()
+        try:
+            self.exchange.load_markets()
+        except ccxt.BaseError as exc:
+            self._abort_if_geo_blocked(exc)
+            raise
         self._load_specs()
         self.capital_usdt = self._resolve_capital()
         self._restore_state()
         self._recover_positions()
         log("CONNECT", "Binance Spot LIVE API connected")
         log("CAPITAL", f"Allocated trading capital: {self.capital_usdt:.2f} USDT")
+
+    @staticmethod
+    def _abort_if_geo_blocked(exc: BaseException) -> None:
+        text = str(exc)
+        if "451" not in text and "restricted location" not in text.lower():
+            return
+        log(
+            "ERROR",
+            "Binance.com returned HTTP 451 (restricted location). "
+            "Render Oregon/US West is in the United States, and Binance.com "
+            "does not allow API access from the US. Move this service to "
+            "Frankfurt or Singapore in Render Dashboard > Settings > Region, "
+            "then redeploy. A US region cannot trade on Binance.com.",
+        )
+        log("ERROR", text)
+        while True:
+            time.sleep(300)
+            log("ERROR", "Still geo-blocked. Change Render region to Frankfurt or Singapore.")
 
     def _load_specs(self) -> None:
         for symbol in CCXT_SYMBOLS:
@@ -590,8 +612,12 @@ class SpotLiveBot:
             except ccxt.InsufficientFunds as exc:
                 log("ERROR", f"Insufficient funds: {exc}")
             except ccxt.NetworkError as exc:
+                if "451" in str(exc) or "restricted location" in str(exc).lower():
+                    self._abort_if_geo_blocked(exc)
                 log("ERROR", f"Network: {exc}")
             except ccxt.BaseError as exc:
+                if "451" in str(exc) or "restricted location" in str(exc).lower():
+                    self._abort_if_geo_blocked(exc)
                 log("ERROR", f"Binance/ccxt: {exc}")
             except Exception as exc:  # noqa: BLE001
                 log("ERROR", f"{type(exc).__name__}: {exc}")

@@ -3,11 +3,14 @@ services:
     name: binance-spot-bot
     runtime: python
     plan: starter
+    region: frankfurt
     buildCommand: pip install -r requirements.txt
     startCommand: bash start.sh
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PYTHON_VERSION
+        value: "3.12.8"
       - key: TRADE_CAPITAL_EUR
         value: "250"
       - key: BINANCE_API_KEY

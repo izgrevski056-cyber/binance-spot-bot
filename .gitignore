@@ -4,4 +4,3 @@ __pycache__/
 *.pyc
 bot_state.json
 bot.log
-.python-version
