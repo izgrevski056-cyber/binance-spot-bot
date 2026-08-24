@@ -175,7 +175,7 @@ class SpotLiveBot:
         client.apiKey = None
         client.secret = None
         try:
-            raw = client.public_get_exchange_info()
+            raw = client.publicGetExchangeInfo()
             rows = [
                 row
                 for row in (raw.get("symbols") or [])
