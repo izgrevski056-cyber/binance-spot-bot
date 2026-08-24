@@ -140,11 +140,15 @@ class SpotLiveBot:
                     "adjustForTimeDifference": True,
                     "recvWindow": 10000,
                     "fetchCurrencies": False,
+                    "fetchMarkets": ["spot"],
                 },
             }
         )
         self.exchange.set_sandbox_mode(False)
         self.exchange.has["fetchCurrencies"] = False
+        self.exchange.options["fetchMarkets"] = ["spot"]
+        self.exchange.options["defaultFetchMarkets"] = ["spot"]
+        self.exchange.options["defaultType"] = "spot"
         self.specs: dict[str, SymbolSpec] = {}
         self.state = BotState()
         self.capital_usdt = Decimal("250")
@@ -152,6 +156,9 @@ class SpotLiveBot:
     def connect(self) -> None:
         try:
             self.exchange.load_markets()
+        except ccxt.AuthenticationError as exc:
+            self._abort_if_auth_error(exc)
+            raise
         except ccxt.BaseError as exc:
             self._abort_if_geo_blocked(exc)
             raise
@@ -179,6 +186,21 @@ class SpotLiveBot:
         while True:
             time.sleep(300)
             log("ERROR", "Still geo-blocked. Change Render region to Frankfurt or Singapore.")
+
+    @staticmethod
+    def _abort_if_auth_error(exc: BaseException) -> None:
+        text = str(exc)
+        log(
+            "ERROR",
+            "Binance rejected the API key (-2015). For Render you need a LIVE "
+            "Spot key with Enable Reading + Enable Spot Trading, and IP access "
+            "set to unrestricted (Render IPs change). Do not enable withdrawals. "
+            "Margin permission is not required; the bot is Spot-only.",
+        )
+        log("ERROR", text)
+        while True:
+            time.sleep(300)
+            log("ERROR", "Still waiting on a valid unrestricted Binance Spot API key.")
 
     def _load_specs(self) -> None:
         for symbol in CCXT_SYMBOLS:
