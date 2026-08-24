@@ -175,17 +175,22 @@ class SpotLiveBot:
         client.apiKey = None
         client.secret = None
         try:
+            client.options.setdefault("crossMarginPairsData", [])
+            client.options.setdefault("isolatedMarginPairsData", [])
             raw = client.publicGetExchangeInfo()
+            wanted = {symbol.replace("/", "") for symbol in CCXT_SYMBOLS}
             rows = [
                 row
                 for row in (raw.get("symbols") or [])
-                if row.get("status") == "TRADING"
-                and row.get("quoteAsset") == QUOTE_ASSET
-                and row.get("isSpotTradingAllowed", True)
+                if row.get("symbol") in wanted and row.get("status") == "TRADING"
             ]
+            if len(rows) != len(wanted):
+                found = {row.get("symbol") for row in rows}
+                missing = ", ".join(sorted(wanted - found)) or "none"
+                raise RuntimeError(f"Missing Spot symbols in exchangeInfo: {missing}")
             markets = client.parse_markets(rows)
             client.set_markets(markets)
-            log("CONNECT", f"Loaded {len(client.markets)} public Spot {QUOTE_ASSET} markets")
+            log("CONNECT", f"Loaded Spot markets: {', '.join(CCXT_SYMBOLS)}")
         finally:
             client.apiKey = saved_key
             client.secret = saved_secret
