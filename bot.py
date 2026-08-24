@@ -139,10 +139,12 @@ class SpotLiveBot:
                     "defaultType": "spot",
                     "adjustForTimeDifference": True,
                     "recvWindow": 10000,
+                    "fetchCurrencies": False,
                 },
             }
         )
         self.exchange.set_sandbox_mode(False)
+        self.exchange.has["fetchCurrencies"] = False
         self.specs: dict[str, SymbolSpec] = {}
         self.state = BotState()
         self.capital_usdt = Decimal("250")
