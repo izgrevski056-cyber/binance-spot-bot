@@ -248,22 +248,25 @@ class SpotLiveBot:
                 amount_step=step if step > 0 else Decimal("0.00000001"),
             )
 
+    def _public_last_price(self, binance_symbol: str) -> Decimal:
+        raw = self.exchange.publicGetTickerPrice({"symbol": binance_symbol})
+        return to_decimal(raw.get("price"))
+
     def _resolve_capital(self) -> Decimal:
-        eur_raw = env_first("TRADE_CAPITAL_EUR")
         usdt_raw = env_first("TRADE_CAPITAL_USDT")
-        if eur_raw:
-            ticker = self.exchange.fetch_ticker("EUR/USDT")
-            rate = to_decimal(ticker.get("last") or ticker.get("close"))
-            capital = (to_decimal(eur_raw) * rate).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-            log("CAPITAL", f"{eur_raw} EUR x {rate:.4f} EUR/USDT = {capital:.2f} USDT")
-            return capital
-        if usdt_raw:
+        eur_raw = env_first("TRADE_CAPITAL_EUR")
+        if usdt_raw and not eur_raw:
             return to_decimal(usdt_raw).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        ticker = self.exchange.fetch_ticker("EUR/USDT")
-        rate = to_decimal(ticker.get("last") or ticker.get("close"))
-        capital = (Decimal("250") * rate).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        log("CAPITAL", f"Default 250 EUR x {rate:.4f} = {capital:.2f} USDT")
-        return capital
+        amount_eur = to_decimal(eur_raw or "250")
+        try:
+            rate = self._public_last_price("EURUSDT")
+            capital = (amount_eur * rate).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            log("CAPITAL", f"{amount_eur} EUR x {rate:.4f} EURUSDT = {capital:.2f} USDT")
+            return capital
+        except Exception as exc:  # noqa: BLE001
+            fallback = Decimal("250.00")
+            log("WARN", f"EURUSDT ticker unavailable ({exc}); using {fallback:.2f} USDT")
+            return fallback
 
     def _restore_state(self) -> None:
         if not STATE_FILE.exists():
