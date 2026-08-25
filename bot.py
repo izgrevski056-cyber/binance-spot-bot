@@ -129,21 +129,23 @@ class SpotLiveBot:
                 "Set them as environment variables (Render Dashboard > Environment)."
             )
 
-        self.exchange = ccxt.binance(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "timeout": 30000,
-                "options": {
-                    "defaultType": "spot",
-                    "adjustForTimeDifference": True,
-                    "recvWindow": 10000,
-                    "fetchCurrencies": False,
-                    "fetchMarkets": {"types": ["spot"]},
-                },
-            }
-        )
+        config = {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "timeout": 30000,
+            "options": {
+                "defaultType": "spot",
+                "adjustForTimeDifference": True,
+                "recvWindow": 10000,
+                "fetchCurrencies": False,
+                "fetchMarkets": {"types": ["spot"]},
+            },
+        }
+        proxy_url = env_first("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+        if proxy_url:
+            config["proxies"] = {"http": proxy_url, "https": proxy_url}
+        self.exchange = ccxt.binance(config)
         self.exchange.set_sandbox_mode(False)
         self.exchange.has["fetchCurrencies"] = False
         self.exchange.options["fetchMarkets"] = {"types": ["spot"]}
