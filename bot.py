@@ -26,7 +26,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
-DRY_RUN = True  # True = paper trading (no live Binance orders). Set False to go live.
+DRY_RUN = False  # True = paper trading (no live Binance orders). Set False to go live.
 CCXT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
 QUOTE_ASSET = "USDT"
 BINANCE_TAKER_FEE = Decimal("0.001")  # 0.1% per side (~0.2% round-trip)
