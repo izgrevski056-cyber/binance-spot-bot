@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Live Binance Spot trading bot for Render.
-Trades BTC/USDT, ETH/USDT, SOL/USDT with a ~250 EUR capital cap.
+Binance Spot scalping bot for Render.
+Trades BTC/USDT, ETH/USDT, SOL/USDT. Sizes each position at 33% of live free USDT.
+Set DRY_RUN = True to paper-trade without placing live orders.
 """
 
 from __future__ import annotations
@@ -25,16 +26,27 @@ load_dotenv(Path(__file__).with_name(".env"))
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
+DRY_RUN = True  # True = paper trading (no live Binance orders). Set False to go live.
 CCXT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
 QUOTE_ASSET = "USDT"
-TAKE_PROFIT_PCT = Decimal("0.008")
+BINANCE_TAKER_FEE = Decimal("0.001")  # 0.1% per side (~0.2% round-trip)
+TAKE_PROFIT_PCT = Decimal("0.0075")  # +0.75% from entry (gross)
+TAKE_PROFIT_NET_PCT = TAKE_PROFIT_PCT - (BINANCE_TAKER_FEE * 2)  # ~+0.55% after fees
 DAILY_STOP_LOSS_PCT = Decimal("0.02")
-MAX_ALLOCATION_PCT = Decimal("0.30")
+MAX_ALLOCATION_PCT = Decimal("0.33")  # 33% of available capital per position
 MAX_OPEN_POSITIONS = 3
-POLL_SECONDS = 8
-COOLDOWN_AFTER_TP_SECONDS = 60
+POLL_SECONDS = 5
+COOLDOWN_AFTER_TP_SECONDS = 15
+ENTRY_TIMEFRAME = "5m"
+RSI_PERIOD = 14
+RSI_OVERSOLD = Decimal("42")
+ATR_PERIOD = 14
+ATR_SPIKE_MULT = Decimal("2.5")
+VOL_LOOKBACK = 20
+VOL_ZSCORE_MAX = Decimal("2")
+OHLCV_LIMIT = 80
 CLIENT_ID_PREFIX = "sbot"
-STATE_FILE = Path(__file__).with_name("bot_state.json")
+STATE_FILE = Path(__file__).with_name("bot_state_paper.json" if DRY_RUN else "bot_state.json")
 LOG_FILE = Path(__file__).with_name("bot.log")
 
 
@@ -72,6 +84,75 @@ def env_first(*names: str) -> str:
         if value:
             return value
     return ""
+
+
+def compute_rsi(closes: list[Decimal], period: int = RSI_PERIOD) -> Decimal | None:
+    if len(closes) < period + 1:
+        return None
+    gains: list[Decimal] = []
+    losses: list[Decimal] = []
+    for prev, curr in zip(closes, closes[1:]):
+        delta = curr - prev
+        gains.append(delta if delta > 0 else Decimal("0"))
+        losses.append(-delta if delta < 0 else Decimal("0"))
+    avg_gain = sum(gains[:period], Decimal("0")) / Decimal(period)
+    avg_loss = sum(losses[:period], Decimal("0")) / Decimal(period)
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * Decimal(period - 1) + gain) / Decimal(period)
+        avg_loss = (avg_loss * Decimal(period - 1) + loss) / Decimal(period)
+    if avg_loss == 0:
+        return Decimal("100") if avg_gain > 0 else Decimal("50")
+    rs = avg_gain / avg_loss
+    return Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+
+
+def compute_stdev(values: list[Decimal]) -> Decimal:
+    if len(values) < 2:
+        return Decimal("0")
+    mean = sum(values, Decimal("0")) / Decimal(len(values))
+    variance = sum((item - mean) ** 2 for item in values) / Decimal(len(values) - 1)
+    if variance <= 0:
+        return Decimal("0")
+    return variance.sqrt()
+
+
+def compute_atr(candles: list, period: int = ATR_PERIOD) -> Decimal | None:
+    if len(candles) < period + 1:
+        return None
+    trs: list[Decimal] = []
+    for prev, curr in zip(candles, candles[1:]):
+        high = to_decimal(curr[2])
+        low = to_decimal(curr[3])
+        prev_close = to_decimal(prev[4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    atr = sum(trs[:period], Decimal("0")) / Decimal(period)
+    for tr in trs[period:]:
+        atr = (atr * Decimal(period - 1) + tr) / Decimal(period)
+    return atr
+
+
+def within_normal_volatility(candles: list, price: Decimal) -> tuple[bool, str]:
+    need = max(VOL_LOOKBACK, ATR_PERIOD) + 1
+    if len(candles) < need:
+        return False, f"need {need} candles, got {len(candles)}"
+    closes = [to_decimal(row[4]) for row in candles[-VOL_LOOKBACK:]]
+    mean = sum(closes, Decimal("0")) / Decimal(len(closes))
+    stdev = compute_stdev(closes)
+    if stdev > 0:
+        zscore = abs(price - mean) / stdev
+        if zscore > VOL_ZSCORE_MAX:
+            return False, f"z-score {zscore:.2f} > {VOL_ZSCORE_MAX}"
+    atr = compute_atr(candles, ATR_PERIOD)
+    last_range = to_decimal(candles[-1][2]) - to_decimal(candles[-1][3])
+    if atr is not None and atr > 0 and last_range > ATR_SPIKE_MULT * atr:
+        return False, f"bar range {last_range:.6f} > {ATR_SPIKE_MULT}x ATR {atr:.6f}"
+    atr_txt = f"{atr:.6f}" if atr is not None else "n/a"
+    return True, f"z<= {VOL_ZSCORE_MAX} ATR {atr_txt}"
+
+
+def take_profit_price(entry: Decimal) -> Decimal:
+    return entry * (Decimal("1") + TAKE_PROFIT_PCT)
 
 
 @dataclass
@@ -123,7 +204,7 @@ class SpotLiveBot:
     def __init__(self) -> None:
         api_key = env_first("BINANCE_API_KEY")
         api_secret = env_first("BINANCE_API_SECRET", "BINANCE_SECRET_KEY")
-        if not api_key or not api_secret:
+        if not DRY_RUN and (not api_key or not api_secret):
             raise SystemExit(
                 "Missing BINANCE_API_KEY / BINANCE_API_SECRET. "
                 "Set them as environment variables (Render Dashboard > Environment)."
@@ -152,34 +233,51 @@ class SpotLiveBot:
         self.exchange.options["defaultType"] = "spot"
         self.specs: dict[str, SymbolSpec] = {}
         self.state = BotState()
-        self.capital_usdt = Decimal("250")
+        self.capital_usdt = Decimal("0")
         self.private_ok = False
         self._last_auth_try = 0.0
+        self.paper_balances: dict[str, Decimal] = {}
 
     def connect(self) -> None:
         try:
             self._load_spot_markets_public()
             self._load_specs()
-            self.capital_usdt = self._resolve_capital()
             self._restore_state()
         except ccxt.BaseError as exc:
             self._abort_if_geo_blocked(exc)
             raise
-        self.private_ok = self._probe_private_api()
-        if self.private_ok:
-            try:
-                self._recover_positions()
-            except ccxt.AuthenticationError as exc:
-                self.private_ok = False
-                log("ERROR", f"Position recover failed auth: {exc}")
-            log("CONNECT", "Binance Spot LIVE API connected")
+        if DRY_RUN:
+            self._init_paper_wallet()
+            self.private_ok = True
+            log("CONNECT", "DRY_RUN paper trading - public prices only, no live Binance orders")
         else:
+            self.private_ok = self._probe_private_api()
+            if self.private_ok:
+                try:
+                    self._recover_positions()
+                except ccxt.AuthenticationError as exc:
+                    self.private_ok = False
+                    log("ERROR", f"Position recover failed auth: {exc}")
+                live_usdt = self.get_balances().get(QUOTE_ASSET, Decimal("0"))
+                self.capital_usdt = live_usdt
+                log("CONNECT", "Binance Spot LIVE API connected")
+                log(
+                    "CAPITAL",
+                    f"Live free USDT {live_usdt:.2f} - each position uses "
+                    f"{MAX_ALLOCATION_PCT * 100:.0f}% (~{(live_usdt * MAX_ALLOCATION_PCT):.2f} USDT)",
+                )
+            else:
+                log(
+                    "AUTH",
+                    "Public market data works. Trading is paused until Binance accepts "
+                    "the API key (Enable Reading + Spot trading, IP unrestricted).",
+                )
+        if DRY_RUN:
             log(
-                "AUTH",
-                "Public market data works. Trading is paused until Binance accepts "
-                "the API key (Enable Reading + Spot trading, IP unrestricted).",
+                "CAPITAL",
+                f"Paper USDT {self.paper_balances.get(QUOTE_ASSET, Decimal('0')):.2f} - "
+                f"{MAX_ALLOCATION_PCT * 100:.0f}% per position",
             )
-        log("CAPITAL", f"Allocated trading capital: {self.capital_usdt:.2f} USDT")
 
     def _probe_private_api(self) -> bool:
         try:
@@ -314,6 +412,11 @@ class SpotLiveBot:
                 entry_price=to_decimal(row["entry_price"]),
                 qty=to_decimal(row["qty"]),
             )
+        if DRY_RUN:
+            self.paper_balances = {
+                str(asset): to_decimal(qty)
+                for asset, qty in (data.get("paper_balances") or {}).items()
+            }
 
     def _save_state(self) -> None:
         payload = {
@@ -329,10 +432,45 @@ class SpotLiveBot:
                 for symbol, pos in self.state.positions.items()
             },
         }
+        if DRY_RUN:
+            payload["paper_balances"] = {
+                asset: str(qty) for asset, qty in self.paper_balances.items()
+            }
         try:
             STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError as exc:
             log("WARN", f"Could not persist state file: {exc}")
+
+    def _init_paper_wallet(self) -> None:
+        wanted = [QUOTE_ASSET, *(spec.base for spec in self.specs.values())]
+        if QUOTE_ASSET not in self.paper_balances:
+            live_usdt = self._try_live_free_usdt()
+            if live_usdt is not None and live_usdt > 0:
+                self.paper_balances[QUOTE_ASSET] = live_usdt
+                log("PAPER", f"Seeded virtual USDT from live Binance free balance: {live_usdt:.2f}")
+            else:
+                self.paper_balances[QUOTE_ASSET] = self._resolve_capital()
+        for asset in wanted:
+            self.paper_balances.setdefault(asset, Decimal("0"))
+        self.capital_usdt = self.paper_balances.get(QUOTE_ASSET, Decimal("0"))
+        held = "  ".join(
+            f"{asset} {fmt_qty(self.paper_balances[asset])}"
+            if asset != QUOTE_ASSET
+            else f"USDT {self.paper_balances[asset]:.2f}"
+            for asset in wanted
+            if asset == QUOTE_ASSET or self.paper_balances[asset] > 0
+        )
+        log("PAPER", f"Virtual wallet: {held}")
+
+    def _try_live_free_usdt(self) -> Decimal | None:
+        if not env_first("BINANCE_API_KEY"):
+            return None
+        try:
+            raw = self.exchange.fetch_balance({"type": "spot"})
+            return to_decimal((raw.get("free") or {}).get(QUOTE_ASSET) or 0)
+        except ccxt.BaseError as exc:
+            log("WARN", f"Could not read live free USDT ({exc})")
+            return None
 
     def _recover_positions(self) -> None:
         """Rebuild bot positions from tagged orders if the disk state was lost (Render)."""
@@ -407,6 +545,8 @@ class SpotLiveBot:
         return prices
 
     def get_balances(self) -> dict[str, Decimal]:
+        if DRY_RUN:
+            return dict(self.paper_balances)
         raw = self.exchange.fetch_balance({"type": "spot"})
         free = raw.get("free") or {}
         wanted = {QUOTE_ASSET, *(spec.base for spec in self.specs.values())}
@@ -437,13 +577,10 @@ class SpotLiveBot:
         return total
 
     def spendable_usdt(self, free_usdt: Decimal, prices: dict[str, Decimal]) -> Decimal:
-        remaining_budget = self.capital_usdt - self.position_value(prices)
-        if remaining_budget <= 0:
-            return Decimal("0")
-        return min(free_usdt, remaining_budget)
+        return max(free_usdt, Decimal("0"))
 
     def bot_equity(self, free_usdt: Decimal, prices: dict[str, Decimal]) -> Decimal:
-        return self.position_value(prices) + self.spendable_usdt(free_usdt, prices)
+        return self.position_value(prices) + max(free_usdt, Decimal("0"))
 
     def roll_daily_window(self, equity: Decimal) -> None:
         today = utc_now().strftime("%Y-%m-%d")
@@ -476,10 +613,12 @@ class SpotLiveBot:
         halt = " HALTED" if self.halted_today() else ""
         print("", flush=True)
         print("=" * 86, flush=True)
+        mode = "PAPER" if DRY_RUN else "USDT"
         log(
             "ACCOUNT",
-            f"USDT {balances.get(QUOTE_ASSET, Decimal('0')):.2f}  |  "
-            f"Bot equity {equity:.2f}/{self.capital_usdt:.2f} USDT  |  "
+            f"{mode} {balances.get(QUOTE_ASSET, Decimal('0')):.2f}  |  "
+            f"Equity {equity:.2f} USDT  |  "
+            f"Size {MAX_ALLOCATION_PCT * 100:.0f}%/pos  |  "
             f"Day PnL {pnl_pct:+.3f}%  |  Open {len(self.state.positions)}/{MAX_OPEN_POSITIONS}{halt}",
         )
         log(
@@ -494,11 +633,12 @@ class SpotLiveBot:
                 log("POSITION", f"{spec.base:<4}  FLAT")
                 continue
             move = (price - pos.entry_price) / pos.entry_price * Decimal("100")
-            tp = pos.entry_price * (Decimal("1") + TAKE_PROFIT_PCT)
+            tp = take_profit_price(pos.entry_price)
             log(
                 "POSITION",
                 f"{spec.base:<4}  LONG {fmt_qty(pos.qty)}  entry {pos.entry_price:.4f}  "
-                f"now {price:.2f}  unrealized {move:+.3f}%  TP {tp:.4f}",
+                f"now {price:.2f}  unrealized {move:+.3f}%  TP {tp:.4f} "
+                f"(+{TAKE_PROFIT_PCT * 100:.2f}% / net ~+{TAKE_PROFIT_NET_PCT * 100:.2f}%)",
             )
         print("=" * 86, flush=True)
 
@@ -507,25 +647,38 @@ class SpotLiveBot:
         stamp = str(int(time.time() * 1000))[-10:]
         return f"{CLIENT_ID_PREFIX}{side[0]}{code}{stamp}"[:36]
 
+    def _last_price(self, symbol: str) -> Decimal:
+        ticker = self.exchange.fetch_ticker(symbol) or {}
+        return to_decimal(ticker.get("last") or ticker.get("close") or 0)
+
     def market_buy(self, symbol: str, quote_amount: Decimal) -> dict | None:
         spec = self.specs[symbol]
         quote_amount = quote_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         if quote_amount < spec.min_cost:
             log("SKIP", f"{symbol} buy {quote_amount:.2f} USDT below min notional {spec.min_cost}")
             return None
-        cost = float(self.exchange.cost_to_precision(symbol, float(quote_amount)))
+        try:
+            cost = to_decimal(self.exchange.cost_to_precision(symbol, float(quote_amount)))
+        except ccxt.InvalidOrder:
+            log("SKIP", f"{symbol} buy {quote_amount:.2f} USDT failed cost precision")
+            return None
+        if cost <= 0:
+            log("SKIP", f"{symbol} buy rounded to zero by precision")
+            return None
+        if DRY_RUN:
+            return self._paper_buy(symbol, spec, cost)
         client_id = self._client_order_id(symbol, "buy")
         log("TRADE", f"ENTRY  {symbol}  LIVE MARKET BUY  spending {cost:.2f} USDT")
         order = self.exchange.create_market_buy_order_with_cost(
             symbol,
-            cost,
+            float(cost),
             {"newClientOrderId": client_id},
         )
         fill_qty = to_decimal(order.get("filled") or order.get("amount") or 0)
         fill_cost = to_decimal(order.get("cost") or cost)
         avg = to_decimal(order.get("average") or 0)
         if fill_qty <= 0 and fill_cost > 0:
-            avg_price = to_decimal((self.exchange.fetch_ticker(symbol) or {}).get("last") or 0)
+            avg_price = self._last_price(symbol)
             fill_qty = fill_cost / avg_price if avg_price else Decimal("0")
             avg = avg_price
         if avg <= 0 and fill_qty > 0:
@@ -539,12 +692,43 @@ class SpotLiveBot:
         )
         return order
 
+    def _paper_buy(self, symbol: str, spec: SymbolSpec, cost: Decimal) -> dict | None:
+        free_usdt = self.paper_balances.get(QUOTE_ASSET, Decimal("0"))
+        if free_usdt < cost:
+            log("SKIP", f"{symbol} paper buy {cost:.2f} USDT > virtual USDT {free_usdt:.2f}")
+            return None
+        avg = self._last_price(symbol)
+        if avg <= 0:
+            log("ERROR", f"{symbol} paper buy: no last price")
+            return None
+        fill_qty = self.amount_to_lot(symbol, (cost / avg) * (Decimal("1") - BINANCE_TAKER_FEE))
+        if fill_qty < spec.min_amount:
+            log("SKIP", f"{symbol} paper buy qty below minimum after {BINANCE_TAKER_FEE * 100:.1f}% fee")
+            return None
+        self.paper_balances[QUOTE_ASSET] = free_usdt - cost
+        self.paper_balances[spec.base] = self.paper_balances.get(spec.base, Decimal("0")) + fill_qty
+        self.state.positions[symbol] = Position(entry_price=avg, qty=fill_qty)
+        self._save_state()
+        log(
+            "PAPER",
+            f"ENTRY  {symbol}  simulated MARKET BUY  spending {cost:.2f} USDT",
+        )
+        log(
+            "PAPER",
+            f"ENTRY FILLED  {symbol}  bought {fmt_qty(fill_qty)} {spec.base}  "
+            f"avg {avg:.4f}  fee {BINANCE_TAKER_FEE * 100:.1f}%  "
+            f"virtual USDT {self.paper_balances[QUOTE_ASSET]:.2f}",
+        )
+        return {"id": "paper", "filled": float(fill_qty), "average": float(avg), "cost": float(cost)}
+
     def market_sell(self, symbol: str, qty: Decimal, reason: str) -> dict | None:
         spec = self.specs[symbol]
         qty = self.amount_to_lot(symbol, qty)
         if qty < spec.min_amount:
             log("SKIP", f"{symbol} sell qty below minimum")
             return None
+        if DRY_RUN:
+            return self._paper_sell(symbol, spec, qty, reason)
         client_id = self._client_order_id(symbol, "sell")
         log("TRADE", f"EXIT  {symbol}  LIVE MARKET SELL  {fmt_qty(qty)} {spec.base}  reason={reason}")
         order = self.exchange.create_order(
@@ -572,19 +756,94 @@ class SpotLiveBot:
         )
         return order
 
+    def _paper_sell(self, symbol: str, spec: SymbolSpec, qty: Decimal, reason: str) -> dict | None:
+        held = self.paper_balances.get(spec.base, Decimal("0"))
+        fill_qty = min(qty, held)
+        fill_qty = self.amount_to_lot(symbol, fill_qty)
+        if fill_qty < spec.min_amount:
+            log("SKIP", f"{symbol} paper sell qty below minimum")
+            return None
+        avg = self._last_price(symbol)
+        if avg <= 0:
+            log("ERROR", f"{symbol} paper sell: no last price")
+            return None
+        fill_cost = (fill_qty * avg * (Decimal("1") - BINANCE_TAKER_FEE)).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        )
+        pos = self.state.positions.get(symbol)
+        pnl_txt = ""
+        if pos and fill_qty > 0 and avg > 0:
+            gross = (avg - pos.entry_price) / pos.entry_price * Decimal("100")
+            net = (
+                (avg * (Decimal("1") - BINANCE_TAKER_FEE))
+                / (pos.entry_price / (Decimal("1") - BINANCE_TAKER_FEE))
+                - Decimal("1")
+            ) * Decimal("100")
+            pnl_txt = f"  vs entry {gross:+.3f}%  net after fees {net:+.3f}%"
+        self.paper_balances[spec.base] = held - fill_qty
+        self.paper_balances[QUOTE_ASSET] = self.paper_balances.get(QUOTE_ASSET, Decimal("0")) + fill_cost
+        self.state.positions.pop(symbol, None)
+        self._save_state()
+        log(
+            "PAPER",
+            f"EXIT  {symbol}  simulated MARKET SELL  {fmt_qty(fill_qty)} {spec.base}  reason={reason}",
+        )
+        log(
+            "PAPER",
+            f"EXIT FILLED  {symbol}  sold {fmt_qty(fill_qty)} {spec.base}  "
+            f"avg {avg:.4f}  proceeds {fill_cost:.2f} USDT{pnl_txt}  "
+            f"virtual USDT {self.paper_balances[QUOTE_ASSET]:.2f}",
+        )
+        return {"id": "paper", "filled": float(fill_qty), "average": float(avg), "cost": float(fill_cost)}
+
     def allocation_quote(self, free_usdt: Decimal, prices: dict[str, Decimal], symbol: str) -> Decimal | None:
         spec = self.specs[symbol]
-        cap = (self.capital_usdt * MAX_ALLOCATION_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        spendable = self.spendable_usdt(free_usdt, prices)
-        amount = min(cap, spendable).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        available = max(free_usdt, Decimal("0"))
+        equity = available + self.position_value(prices)
+        amount = (equity * MAX_ALLOCATION_PCT).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        amount = min(amount, available)
         if amount < spec.min_cost:
             log(
                 "SKIP",
                 f"{symbol} size {amount:.2f} USDT below min {spec.min_cost} "
-                f"(30% cap {cap:.2f}, spendable {spendable:.2f})",
+                f"(live free {available:.2f}, {MAX_ALLOCATION_PCT * 100:.0f}% of equity {equity:.2f})",
             )
             return None
+        log(
+            "SIZE",
+            f"{symbol} allocating {amount:.2f} USDT "
+            f"({MAX_ALLOCATION_PCT * 100:.0f}% of equity {equity:.2f}, free {available:.2f})",
+        )
         return amount
+
+    def fetch_ohlcv_candles(self, symbol: str) -> list:
+        candles = self.exchange.fetch_ohlcv(symbol, ENTRY_TIMEFRAME, limit=OHLCV_LIMIT)
+        return [row for row in candles if row and len(row) > 4]
+
+    def entry_signal(self, symbol: str, price: Decimal) -> bool:
+        try:
+            candles = self.fetch_ohlcv_candles(symbol)
+        except ccxt.BaseError as exc:
+            log("WARN", f"{symbol} entry signal skipped - OHLCV error: {exc}")
+            return False
+        closes = [to_decimal(row[4]) for row in candles]
+        rsi = compute_rsi(closes)
+        rsi_ok = rsi is not None and rsi < RSI_OVERSOLD
+        vol_ok, vol_txt = within_normal_volatility(candles, price)
+        rsi_txt = f"{rsi:.1f}" if rsi is not None else "n/a"
+        if rsi_ok and vol_ok:
+            log(
+                "SIGNAL",
+                f"{symbol} BUY  RSI({RSI_PERIOD}) {rsi_txt} < {RSI_OVERSOLD} AND "
+                f"volatility normal ({vol_txt})  ({ENTRY_TIMEFRAME})",
+            )
+            return True
+        log(
+            "SKIP",
+            f"{symbol} no entry  RSI({RSI_PERIOD}) {rsi_txt}  vol {vol_txt}  "
+            f"price {price:.4f}  (need RSI < {RSI_OVERSOLD} AND normal volatility)",
+        )
+        return False
 
     def maybe_enter(self, symbol: str, free_usdt: Decimal, prices: dict[str, Decimal]) -> Decimal:
         if symbol in self.state.positions:
@@ -595,6 +854,8 @@ class SpotLiveBot:
         if time.time() < cooldown_until:
             remaining = int(cooldown_until - time.time())
             log("WAIT", f"{symbol} cooldown after take-profit - {remaining}s left")
+            return free_usdt
+        if not self.entry_signal(symbol, prices[symbol]):
             return free_usdt
         quote_amount = self.allocation_quote(free_usdt, prices, symbol)
         if quote_amount is None:
@@ -621,19 +882,20 @@ class SpotLiveBot:
     def maybe_take_profits(self, prices: dict[str, Decimal], balances: dict[str, Decimal]) -> None:
         for symbol, pos in list(self.state.positions.items()):
             price = prices[symbol]
-            target = pos.entry_price * (Decimal("1") + TAKE_PROFIT_PCT)
+            target = take_profit_price(pos.entry_price)
             if price < target:
                 continue
             log(
                 "TRADE",
-                f"TAKE-PROFIT HIT  {symbol}  price {price:.4f} >= target {target:.4f} "
-                f"(+{TAKE_PROFIT_PCT * 100:.1f}% from {pos.entry_price:.4f})",
+                f"TAKE-PROFIT HIT  {symbol}  price {price:.4f} >= target {target:.4f}  "
+                f"+{TAKE_PROFIT_PCT * 100:.2f}% from entry  "
+                f"(net ~+{TAKE_PROFIT_NET_PCT * 100:.2f}% after {BINANCE_TAKER_FEE * 200:.1f}% fees)  "
+                f"from {pos.entry_price:.4f}",
             )
-            spec = self.specs[symbol]
-            qty = self.sellable_qty(symbol, min(balances.get(spec.base, Decimal("0")), pos.qty))
+            qty = self.sellable_qty(symbol, min(balances.get(self.specs[symbol].base, Decimal("0")), pos.qty))
             if qty <= 0:
                 qty = self.amount_to_lot(symbol, pos.qty)
-            self.market_sell(symbol, qty, reason="take_profit_0.8pct")
+            self.market_sell(symbol, qty, reason="take_profit_0.75pct")
             self.state.cooldowns[symbol] = time.time() + COOLDOWN_AFTER_TP_SECONDS
             time.sleep(0.4)
 
@@ -659,15 +921,21 @@ class SpotLiveBot:
         return True
 
     def run_loop(self) -> None:
+        mode = "PAPER / DRY_RUN (no live orders)" if DRY_RUN else "LIVE Binance Spot (real funds)"
         print("=" * 86)
-        print(" Binance Spot LIVE bot")
+        print(" Binance Spot scalper")
         print(f" Pairs           : {', '.join(CCXT_SYMBOLS)}")
-        print(f" Capital cap     : ~{self.capital_usdt:.2f} USDT (from 250 EUR unless overridden)")
-        print(f" Max per trade   : {MAX_ALLOCATION_PCT * 100:.0f}% of allocated capital")
+        print(f" Position size   : {MAX_ALLOCATION_PCT * 100:.0f}% of live free/equity USDT per trade")
         print(f" Max positions   : {MAX_OPEN_POSITIONS} (one per coin)")
-        print(f" Take-profit     : +{TAKE_PROFIT_PCT * 100:.1f}% from entry")
+        print(
+            f" Entry           : RSI({RSI_PERIOD})<{RSI_OVERSOLD} AND normal volatility on {ENTRY_TIMEFRAME}"
+        )
+        print(
+            f" Take-profit     : +{TAKE_PROFIT_PCT * 100:.2f}% from entry "
+            f"(net ~+{TAKE_PROFIT_NET_PCT * 100:.2f}% after {BINANCE_TAKER_FEE * 200:.1f}% fees)"
+        )
         print(f" Daily stop-loss : -{DAILY_STOP_LOSS_PCT * 100:.1f}% vs UTC-day starting equity")
-        print(" Mode            : LIVE Binance Spot (real funds)")
+        print(f" Mode            : {mode}")
         print(" Stop            : Ctrl+C  |  Render: stop the service")
         print("=" * 86)
 

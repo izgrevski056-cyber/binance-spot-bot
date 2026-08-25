@@ -4,4 +4,5 @@ venv/
 __pycache__/
 *.pyc
 bot_state.json
+bot_state_paper.json
 bot.log
