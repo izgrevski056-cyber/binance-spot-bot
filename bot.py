@@ -68,7 +68,7 @@ def fmt_qty(qty: Decimal) -> str:
 
 def env_first(*names: str) -> str:
     for name in names:
-        value = os.getenv(name, "").strip()
+        value = os.getenv(name, "").strip().strip('"').strip("'").replace("\n", "").replace("\r", "")
         if value:
             return value
     return ""
@@ -151,6 +151,8 @@ class SpotLiveBot:
         self.specs: dict[str, SymbolSpec] = {}
         self.state = BotState()
         self.capital_usdt = Decimal("250")
+        self.private_ok = False
+        self._last_auth_try = 0.0
 
     def connect(self) -> None:
         try:
@@ -158,15 +160,39 @@ class SpotLiveBot:
             self._load_specs()
             self.capital_usdt = self._resolve_capital()
             self._restore_state()
-            self._recover_positions()
-        except ccxt.AuthenticationError as exc:
-            self._abort_if_auth_error(exc)
-            raise
         except ccxt.BaseError as exc:
             self._abort_if_geo_blocked(exc)
             raise
-        log("CONNECT", "Binance Spot LIVE API connected")
+        self.private_ok = self._probe_private_api()
+        if self.private_ok:
+            try:
+                self._recover_positions()
+            except ccxt.AuthenticationError as exc:
+                self.private_ok = False
+                log("ERROR", f"Position recover failed auth: {exc}")
+            log("CONNECT", "Binance Spot LIVE API connected")
+        else:
+            log(
+                "AUTH",
+                "Public market data works. Trading is paused until Binance accepts "
+                "the API key (Enable Reading + Spot trading, IP unrestricted).",
+            )
         log("CAPITAL", f"Allocated trading capital: {self.capital_usdt:.2f} USDT")
+
+    def _probe_private_api(self) -> bool:
+        try:
+            self.exchange.fetch_balance({"type": "spot"})
+            log("AUTH", "Private Spot API accepted the key")
+            return True
+        except ccxt.AuthenticationError as exc:
+            log(
+                "ERROR",
+                "Binance rejected the API key (-2015) on fetch_balance. "
+                "This is not a missing Render env var. In Binance API Management "
+                "enable Reading + Spot trading and set IP access to Unrestricted.",
+            )
+            log("ERROR", str(exc))
+            return False
 
     def _load_spot_markets_public(self) -> None:
         """Load Spot markets from public exchangeInfo only. Never call signed margin/sapi."""
@@ -634,6 +660,27 @@ class SpotLiveBot:
 
         while True:
             try:
+                if not self.private_ok:
+                    prices = self.get_prices()
+                    log(
+                        "PRICES",
+                        "  ".join(
+                            f"{self.specs[symbol].base} {prices[symbol]:.2f}"
+                            for symbol in CCXT_SYMBOLS
+                        ),
+                    )
+                    now = time.time()
+                    if now - self._last_auth_try >= 60:
+                        self._last_auth_try = now
+                        self.private_ok = self._probe_private_api()
+                        if self.private_ok:
+                            self._recover_positions()
+                            log("CONNECT", "Private API is working - trading enabled")
+                    else:
+                        log("AUTH", "Trading paused - waiting for a valid unrestricted Binance Spot key")
+                    time.sleep(POLL_SECONDS)
+                    continue
+
                 prices = self.get_prices()
                 balances = self.get_balances()
                 free_usdt = balances.get(QUOTE_ASSET, Decimal("0"))

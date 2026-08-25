@@ -1,4 +1,5 @@
 .env
+.render_api_key
 venv/
 __pycache__/
 *.pyc
