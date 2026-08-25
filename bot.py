@@ -142,7 +142,7 @@ class SpotLiveBot:
                 "fetchMarkets": {"types": ["spot"]},
             },
         }
-        proxy_url = env_first("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+        proxy_url = env_first("BOT_HTTPS_PROXY", "BOT_HTTP_PROXY")
         if proxy_url:
             config["proxies"] = {"http": proxy_url, "https": proxy_url}
         self.exchange = ccxt.binance(config)
@@ -338,7 +338,11 @@ class SpotLiveBot:
         """Rebuild bot positions from tagged orders if the disk state was lost (Render)."""
         balances = self.get_balances()
         for symbol, spec in self.specs.items():
-            wallet = self.sellable_qty(symbol, balances.get(spec.base, Decimal("0")))
+            free_qty = balances.get(spec.base, Decimal("0"))
+            if free_qty < spec.min_amount:
+                wallet = Decimal("0")
+            else:
+                wallet = self.sellable_qty(symbol, free_qty)
             if symbol in self.state.positions:
                 if wallet <= 0:
                     log("RECOVER", f"{symbol}: state had a position but wallet is empty - clearing")
@@ -409,11 +413,18 @@ class SpotLiveBot:
         return {asset: to_decimal(free.get(asset) or 0) for asset in wanted}
 
     def amount_to_lot(self, symbol: str, qty: Decimal) -> Decimal:
-        precise = self.exchange.amount_to_precision(symbol, float(qty))
+        if qty <= 0:
+            return Decimal("0")
+        try:
+            precise = self.exchange.amount_to_precision(symbol, float(qty))
+        except ccxt.InvalidOrder:
+            return Decimal("0")
         return to_decimal(precise)
 
     def sellable_qty(self, symbol: str, free_qty: Decimal) -> Decimal:
         spec = self.specs[symbol]
+        if free_qty <= 0 or free_qty < spec.min_amount:
+            return Decimal("0")
         qty = self.amount_to_lot(symbol, free_qty)
         if qty < spec.min_amount:
             return Decimal("0")
