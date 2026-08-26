@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: binance-spot-bot
+    name: forex-paper-bot
     runtime: python
     plan: starter
     region: frankfurt
@@ -11,9 +11,19 @@ services:
         value: "1"
       - key: PYTHON_VERSION
         value: "3.12.8"
-      - key: TRADE_CAPITAL_EUR
-        value: "250"
-      - key: BINANCE_API_KEY
+      - key: STARTING_CAPITAL_EUR
+        value: "50"
+      - key: MAX_LOT
+        value: "0.01"
+      - key: MAX_RISK_EUR
+        value: "0.50"
+      - key: TP_RATIO
+        value: "2.0"
+      - key: TIMEFRAME
+        value: "5m"
+      - key: OANDA_ENVIRONMENT
+        value: "practice"
+      - key: OANDA_API_KEY
         sync: false
-      - key: BINANCE_API_SECRET
+      - key: OANDA_ACCOUNT_ID
         sync: false
